@@ -29,6 +29,9 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     && ln -sf /usr/bin/python${PYTHON_VERSION}-config /usr/bin/python3-config \
     && curl -sS https://bootstrap.pypa.io/get-pip.py | python${PYTHON_VERSION} \
     && python3 --version && python3 -m pip --version
+# Install uv for faster pip installs
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install uv
 
 # Upgrade to GCC 10 to avoid https://gcc.gnu.org/bugzilla/show_bug.cgi?id=92519
 # as it was causing spam when compiling the CUTLASS kernels
@@ -51,7 +54,7 @@ COPY requirements-common.txt requirements-common.txt
 COPY requirements-cuda.txt requirements-cuda.txt
 COPY requirements-cuda-arm64.txt requirements-cuda-arm64.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install -r requirements-cuda.txt
+    uv pip install --system -r requirements-cuda.txt
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
@@ -77,7 +80,7 @@ ARG TARGETPLATFORM
 COPY requirements-build.txt requirements-build.txt
 
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install -r requirements-build.txt
+    uv pip install --system -r requirements-build.txt
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
@@ -208,7 +211,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=bind,source=.git,target=.git \
     if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
         apt-get update && apt-get install -y cuda-toolkit-12-4 && \
-        git clone -b v0.2.0.post2 https://github.com/flashinfer-ai/flashinfer.git --recursive && \
+        git clone -b v0.2.1.post1 https://github.com/flashinfer-ai/flashinfer.git --recursive && \
         cd flashinfer && \
         pip --verbose wheel --use-pep517 --no-deps -w /workspace/dist --no-build-isolation --no-cache-dir . ; \
     fi
@@ -243,7 +246,7 @@ COPY requirements-lint.txt requirements-lint.txt
 COPY requirements-test.txt requirements-test.txt
 COPY requirements-dev.txt requirements-dev.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install -r requirements-dev.txt
+    uv pip install --system -r requirements-dev.txt
 #################### DEV IMAGE ####################
 
 #################### vLLM installation IMAGE ####################
@@ -274,6 +277,9 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     && ln -sf /usr/bin/python${PYTHON_VERSION}-config /usr/bin/python3-config \
     && curl -sS https://bootstrap.pypa.io/get-pip.py | python${PYTHON_VERSION} \
     && python3 --version && python3 -m pip --version
+# Install uv for faster pip installs
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install uv
 
 # Workaround for https://github.com/openai/triton/issues/2507 and
 # https://github.com/pytorch/pytorch/issues/107960 -- hopefully
@@ -314,15 +320,15 @@ ADD . /vllm-workspace/
 
 # install development dependencies (for testing)
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install -r requirements-dev.txt
+    uv pip install --system -r requirements-dev.txt
 
 # install development dependencies (for testing)
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install -e tests/vllm_test_utils
+    uv pip install --system -e tests/vllm_test_utils
 
 # enable fast downloads from hf (for testing)
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install hf_transfer
+    uv pip install --system hf_transfer
 ENV HF_HUB_ENABLE_HF_TRANSFER 1
 
 # Copy in the v1 package for testing (it isn't distributed yet)
@@ -343,9 +349,9 @@ FROM vllm-base AS vllm-openai-base
 # install additional dependencies for openai api server
 RUN --mount=type=cache,target=/root/.cache/pip \
     if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
-        pip install accelerate hf_transfer 'modelscope!=1.15.0' 'bitsandbytes>=0.45.0' 'timm==0.9.10' 'boto3' 'runai-model-streamer' 'runai-model-streamer[s3]'; \
+        pip install --system accelerate hf_transfer 'modelscope!=1.15.0' 'bitsandbytes>=0.45.0' 'timm==0.9.10' 'boto3' 'runai-model-streamer' 'runai-model-streamer[s3]'; \
     else \
-        pip install accelerate hf_transfer 'modelscope!=1.15.0' 'bitsandbytes>=0.45.0' 'timm==0.9.10' 'boto3' 'runai-model-streamer' 'runai-model-streamer[s3]'; \
+        pip install --system accelerate hf_transfer 'modelscope!=1.15.0' 'bitsandbytes>=0.45.0' 'timm==0.9.10' 'boto3' 'runai-model-streamer' 'runai-model-streamer[s3]'; \
     fi
 ENV VLLM_USAGE_SOURCE production-docker-image
 
