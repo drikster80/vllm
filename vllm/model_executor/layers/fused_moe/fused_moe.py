@@ -16,6 +16,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8)
 from vllm.platforms import current_platform
 from vllm.utils import direct_register_custom_op
+from .fused_cached_moe import is_in_pinned_memory, async_copy_expert
 
 logger = init_logger(__name__)
 
