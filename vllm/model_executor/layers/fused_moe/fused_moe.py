@@ -1145,7 +1145,8 @@ def fused_experts(hidden_states: torch.Tensor,
                   w2_zp: Optional[torch.Tensor] = None,
                   a1_scale: Optional[torch.Tensor] = None,
                   a2_scale: Optional[torch.Tensor] = None,
-                  block_shape: Optional[List[int]] = None):
+                  block_shape: Optional[List[int]] = None,
+                  expert_cache_manager: Optional[Any] = None):
     if inplace:
         torch.ops.vllm.inplace_fused_experts(hidden_states, w1, w2,
                                              topk_weights, topk_ids,
@@ -1176,7 +1177,8 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                        w2_zp: Optional[torch.Tensor] = None,
                        a1_scale: Optional[torch.Tensor] = None,
                        a2_scale: Optional[torch.Tensor] = None,
-                       block_shape: Optional[List[int]] = None):
+                       block_shape: Optional[List[int]] = None,
+                       expert_cache_manager: Optional[Any] = None):
     # Check constraints.
     if use_int4_w4a16:
         assert hidden_states.shape[1] // 2 == w1.shape[
@@ -1268,10 +1270,11 @@ def fused_experts_impl(hidden_states: torch.Tensor,
         chunk_experts = torch.unique(expert_ids).cpu().tolist()
         
         # Check and load only the needed experts via cache manager
-        for expert in chunk_experts:
-            if not self.expert_cache_manager.is_resident(expert):
-                self.expert_cache_manager.load_expert(expert, w1[expert])
-                self.expert_cache_manager.load_expert(expert, w2[expert])
+        if expert_cache_manager is not None:
+            for expert in chunk_experts:
+                if not expert_cache_manager.is_resident(expert):
+                    expert_cache_manager.load_expert(expert, w1[expert])
+                    expert_cache_manager.load_expert(expert, w2[expert])
 
         invoke_fused_moe_kernel(curr_hidden_states,
                                 w1,
