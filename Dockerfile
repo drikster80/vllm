@@ -2,13 +2,15 @@
 # to run the OpenAI compatible server.
 
 # Please update any changes made here to
+# docs/source/dev/dockerfile/dockerfile.rst and
+# docs/source/assets/dev/dockerfile-stages-dependency.png
 # docs/source/contributing/dockerfile/dockerfile.md and
 # docs/source/assets/contributing/dockerfile-stages-dependency.png
 
 ARG CUDA_VERSION=12.4.1
 #################### BASE BUILD IMAGE ####################
 # prepare basic build environment
-FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu20.04 AS base
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04 AS base
 ARG CUDA_VERSION=12.4.1
 ARG PYTHON_VERSION=3.12
 ARG TARGETPLATFORM
@@ -18,7 +20,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     && echo 'tzdata tzdata/Zones/America select Los_Angeles' | debconf-set-selections \
     && apt-get update -y \
-    && apt-get install -y ccache software-properties-common git curl sudo \
+    && apt-get install -y --allow-change-held-packages ccache software-properties-common git curl wget sudo kmod libtcmalloc-minimal4 libnccl2 libnccl-dev \
     && add-apt-repository ppa:deadsnakes/ppa \
     && apt-get update -y \
     && apt-get install -y python${PYTHON_VERSION} python${PYTHON_VERSION}-dev python${PYTHON_VERSION}-venv \
@@ -48,20 +50,16 @@ RUN ldconfig /usr/local/cuda-$(echo $CUDA_VERSION | cut -d. -f1,2)/compat/
 WORKDIR /workspace
 
 # install build and runtime dependencies
-
-# arm64 (GH200) build follows the practice of "use existing pytorch" build,
-# we need to install torch and torchvision from the nightly builds first,
-# pytorch will not appear as a vLLM dependency in all of the following steps
-# after this step
-RUN --mount=type=cache,target=/root/.cache/pip \
-    if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
-        uv pip install --system --index-url https://download.pytorch.org/whl/nightly/cu126 "torch==2.7.0.dev20250121+cu126" "torchvision==0.22.0.dev20250121";  \
-    fi
-
 COPY requirements-common.txt requirements-common.txt
 COPY requirements-cuda.txt requirements-cuda.txt
+COPY requirements-cuda-arm64.txt requirements-cuda-arm64.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     uv pip install --system -r requirements-cuda.txt
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
+        python3 -m pip install -r requirements-cuda-arm64.txt; \
+    fi
 
 # cuda arch list used by torch
 # can be useful for both `dev` and `test`
@@ -83,6 +81,11 @@ COPY requirements-build.txt requirements-build.txt
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     uv pip install --system -r requirements-build.txt
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
+        python3 -m pip install -r requirements-cuda-arm64.txt; \
+    fi
 
 COPY . .
 ARG GIT_REPO_CHECK=0
@@ -120,12 +123,107 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     fi
 
 ENV CCACHE_DIR=/root/.cache/ccache
+
+RUN --mount=type=cache,target=/var/cache/apt \
+    --mount=type=cache,target=/var/lib/apt \
+    --mount=type=bind,source=.git,target=.git \
+    apt-get update && apt-get install -y \
+        g++ \
+        cmake \
+        libcurl4-openssl-dev \
+        libssl-dev \
+        zlib1g-dev \
+        libgtest-dev \
+        git \
+        build-essential
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=bind,source=.git,target=.git \
+    git clone --recurse-submodules https://github.com/aws/aws-sdk-cpp.git && \
+    cd aws-sdk-cpp && \
+    mkdir build && \
+    cd build && \
+    cmake .. \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_ONLY="s3;core;s3-crt" \
+        -DBUILD_AWS_CRT_CPP=ON \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DENABLE_TESTING=OFF \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON && \
+    make -j $(nproc) && \
+    make install && \
+    cd ../.. && \
+    rm -rf aws-sdk-cpp && \
+    ldconfig
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=bind,source=.git,target=.git \
+    if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
+        curl -fsSL https://releases.bazel.build/7.0.0/release/bazel-7.0.0-linux-arm64 -o /usr/local/bin/bazel && \
+        chmod +x /usr/local/bin/bazel && \
+        git clone -b 0.11.1 https://github.com/run-ai/runai-model-streamer.git --recursive && \
+        cd  runai-model-streamer && \
+        USE_SYSTEM_LIBS=1 make build && \
+        pip --verbose wheel --use-pep517 --no-deps -w /workspace/dist --no-build-isolation --no-cache-dir py/runai_model_streamer && \
+        pip --verbose wheel --use-pep517 --no-deps -w /workspace/dist --no-build-isolation --no-cache-dir py/runai_model_streamer_s3; \
+    fi
+
 RUN --mount=type=cache,target=/root/.cache/ccache \
     --mount=type=cache,target=/root/.cache/pip \
     --mount=type=bind,source=.git,target=.git  \
     if [ "$USE_SCCACHE" != "1" ]; then \
         python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38; \
     fi
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=bind,source=.git,target=.git \
+    if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
+        apt-get update && apt-get install zlib1g-dev && \
+        python3 -m pip install packaging pybind11 && \
+        git clone -b release/3.1.x https://github.com/openai/triton && \
+        cd triton/python && \
+        git submodule update --init --recursive && \
+        pip --verbose wheel --use-pep517 --no-deps -w /workspace/dist --no-build-isolation --no-cache-dir . ; \
+    fi
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=bind,source=.git,target=.git \
+    if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
+    CAUSAL_CONV1D_FORCE_BUILD=TRUE CAUSAL_CONV1D_SKIP_CUDA_BUILD=FALSE pip --verbose wheel --use-pep517 --no-deps -w /workspace/dist --no-build-isolation --no-cache-dir git+https://github.com/Dao-AILab/causal-conv1d.git ; \
+    fi
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
+       git clone -b v0.0.28.post3 https://github.com/facebookresearch/xformers.git --recursive && \
+       cd xformers && \
+       pip --verbose wheel --use-pep517 --no-deps -w /workspace/dist --no-build-isolation --no-cache-dir . ; \
+    fi
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=bind,source=.git,target=.git \
+    if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
+    MAMBA_FORCE_BUILD=TRUE pip --verbose wheel --use-pep517 --no-deps -w /workspace/dist --no-build-isolation --no-cache-dir git+https://github.com/state-spaces/mamba.git ; \
+    fi
+
+ENV FLASHINFER_ENABLE_AOT=1
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=bind,source=.git,target=.git \
+    if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
+        apt-get update && apt-get install -y cuda-toolkit-12-4 && \
+        git clone -b v0.2.0.post2 https://github.com/flashinfer-ai/flashinfer.git --recursive && \
+        cd flashinfer && \
+        pip --verbose wheel --use-pep517 --no-deps -w /workspace/dist --no-build-isolation --no-cache-dir . ; \
+    fi
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=bind,source=.git,target=.git \
+    if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
+        git clone -b 0.45.0 https://github.com/bitsandbytes-foundation/bitsandbytes.git && \
+        cd bitsandbytes && \
+        pip --verbose wheel --use-pep517 --no-deps -w /workspace/dist --no-build-isolation --no-cache-dir . ; \
+    fi
+
 
 # Check the size of the wheel if RUN_WHEEL_CHECK is true
 COPY .buildkite/check-wheel-size.py check-wheel-size.py
@@ -138,6 +236,7 @@ RUN if [ "$RUN_WHEEL_CHECK" = "true" ]; then \
     else \
         echo "Skipping wheel size check."; \
     fi
+
 #################### EXTENSION Build IMAGE ####################
 
 #################### DEV IMAGE ####################
@@ -152,13 +251,14 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 #################### vLLM installation IMAGE ####################
 # image with vLLM installed
-# TODO: Restore to base image after FlashInfer AOT wheel fixed
-FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04 AS vllm-base
+FROM nvidia/cuda:${CUDA_VERSION}-base-ubuntu22.04 AS vllm-base
 ARG CUDA_VERSION=12.4.1
 ARG PYTHON_VERSION=3.12
 WORKDIR /vllm-workspace
 ENV DEBIAN_FRONTEND=noninteractive
 ARG TARGETPLATFORM
+
+COPY requirements-cuda-arm64.txt requirements-cuda-arm64.txt
 
 RUN PYTHON_VERSION_STR=$(echo ${PYTHON_VERSION} | sed 's/\.//g') && \
     echo "export PYTHON_VERSION_STR=${PYTHON_VERSION_STR}" >> /etc/environment
@@ -167,7 +267,7 @@ RUN PYTHON_VERSION_STR=$(echo ${PYTHON_VERSION} | sed 's/\.//g') && \
 RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     && echo 'tzdata tzdata/Zones/America select Los_Angeles' | debconf-set-selections \
     && apt-get update -y \
-    && apt-get install -y ccache software-properties-common git curl wget sudo vim python3-pip \
+    && apt-get install -y ccache software-properties-common git curl wget sudo vim python3-pip libnccl2 libtcmalloc-minimal4 \
     && apt-get install -y ffmpeg libsm6 libxext6 libgl1 \
     && add-apt-repository ppa:deadsnakes/ppa \
     && apt-get update -y \
@@ -187,47 +287,31 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # or future versions of triton.
 RUN ldconfig /usr/local/cuda-$(echo $CUDA_VERSION | cut -d. -f1,2)/compat/
 
-# arm64 (GH200) build follows the practice of "use existing pytorch" build,
-# we need to install torch and torchvision from the nightly builds first,
-# pytorch will not appear as a vLLM dependency in all of the following steps
-# after this step
-RUN --mount=type=cache,target=/root/.cache/pip \
-    if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
-        uv pip install --system --index-url https://download.pytorch.org/whl/nightly/cu124 "torch==2.6.0.dev20241210+cu124" "torchvision==0.22.0.dev20241215";  \
-    fi
-
 # Install vllm wheel first, so that torch etc will be installed.
+# On Arm64 platforms, all newly compiled wheels will also be installed (flashinfer, triton, mamba, etc.)
 RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist \
     --mount=type=cache,target=/root/.cache/pip \
-    uv pip install --system dist/*.whl --verbose
+    python3 -m pip install $(ls dist/*.whl | grep -v "flashinfer_python") --verbose
 
-# If we need to build FlashInfer wheel before its release:
-# $ export FLASHINFER_ENABLE_AOT=1
-# $ # Note we remove 7.0 from the arch list compared to the list below, since FlashInfer only supports sm75+
-# $ export TORCH_CUDA_ARCH_LIST='7.5 8.0 8.6 8.9 9.0+PTX'
-# $ git clone https://github.com/flashinfer-ai/flashinfer.git --recursive
-# $ cd flashinfer
-# $ git checkout 524304395bd1d8cd7d07db083859523fcaa246a4
-# $ rm -rf build
-# $ python3 setup.py bdist_wheel --dist-dir=dist --verbose
-# $ ls dist
-# $ # upload the wheel to a public location, e.g. https://wheels.vllm.ai/flashinfer/524304395bd1d8cd7d07db083859523fcaa246a4/flashinfer_python-0.2.1.post1+cu124torch2.5-cp38-abi3-linux_x86_64.whl
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
+
+        pip uninstall -y torch && \
+        python3 -m pip install -r requirements-cuda-arm64.txt; \
+    fi
+
+RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist \
+    --mount=type=cache,target=/root/.cache/pip \
+
+    python3 -m pip install dist/flashinfer_python*.whl --verbose
 
 RUN --mount=type=cache,target=/root/.cache/pip \
 . /etc/environment && \
 if [ "$TARGETPLATFORM" != "linux/arm64" ]; then \
-    uv pip install --system https://github.com/flashinfer-ai/flashinfer/releases/download/v0.2.1.post1/flashinfer_python-0.2.1.post1+cu124torch2.5-cp38-abi3-linux_x86_64.whl ; \
+
+    python3 -m pip install https://github.com/flashinfer-ai/flashinfer/releases/download/v0.1.6/flashinfer-0.1.6+cu121torch2.4-cp${PYTHON_VERSION_STR}-cp${PYTHON_VERSION_STR}-linux_x86_64.whl; \
 fi
 COPY examples examples
-
-# Although we build Flashinfer with AOT mode, there's still
-# some issues w.r.t. JIT compilation. Therefore we need to
-# install build dependencies for JIT compilation.
-# TODO: Remove this once FlashInfer AOT wheel is fixed
-COPY requirements-build.txt requirements-build.txt
-RUN --mount=type=cache,target=/root/.cache/pip \
-    uv pip install --system -r requirements-build.txt
-
 #################### vLLM installation IMAGE ####################
 
 #################### TEST IMAGE ####################
@@ -268,13 +352,15 @@ FROM vllm-base AS vllm-openai-base
 # install additional dependencies for openai api server
 RUN --mount=type=cache,target=/root/.cache/pip \
     if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
-        uv pip install --system accelerate hf_transfer 'modelscope!=1.15.0' 'bitsandbytes>=0.42.0' 'timm==0.9.10' boto3 runai-model-streamer runai-model-streamer[s3]; \
-    else \
-        uv pip install --system accelerate hf_transfer 'modelscope!=1.15.0' 'bitsandbytes>=0.45.0' 'timm==0.9.10' boto3 runai-model-streamer runai-model-streamer[s3]; \
-    fi
 
+        pip install accelerate hf_transfer 'modelscope!=1.15.0' 'bitsandbytes>=0.45.0' 'timm==0.9.10' 'boto3' 'runai-model-streamer' 'runai-model-streamer[s3]'; \
+    else \
+        pip install accelerate hf_transfer 'modelscope!=1.15.0' 'bitsandbytes>=0.45.0' 'timm==0.9.10' 'boto3' 'runai-model-streamer' 'runai-model-streamer[s3]'; \
+
+    fi
 ENV VLLM_USAGE_SOURCE production-docker-image
 
+#################### OPENAI API SERVER ####################
 # define sagemaker first, so it is not default from `docker build`
 FROM vllm-openai-base AS vllm-sagemaker
 
@@ -286,3 +372,4 @@ FROM vllm-openai-base AS vllm-openai
 
 ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
 #################### OPENAI API SERVER ####################
+
