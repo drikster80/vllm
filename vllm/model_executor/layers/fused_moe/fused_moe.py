@@ -1257,9 +1257,9 @@ def fused_experts_impl(hidden_states: torch.Tensor,
         
         # Check and load only the needed experts via cache manager
         for expert in chunk_experts:
-            if not model.expert_cache_manager.is_resident(expert):
-                model.expert_cache_manager.load_expert(expert, w1[expert])
-                model.expert_cache_manager.load_expert(expert, w2[expert])
+            if not w1.expert_cache_manager.is_resident(expert):
+                w1.expert_cache_manager.load_expert(expert, w1[expert])
+                w1.expert_cache_manager.load_expert(expert, w2[expert])
 
         invoke_fused_moe_kernel(curr_hidden_states,
                                 w1,
