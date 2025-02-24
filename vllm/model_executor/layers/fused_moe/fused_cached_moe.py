@@ -16,6 +16,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8)
 from vllm.platforms import current_platform
 from vllm.utils import direct_register_custom_op
+from .fused_moe import ceil_div, get_config_dtype_str
 
 logger = init_logger(__name__)
 
@@ -32,6 +33,7 @@ def async_copy_expert(weights: torch.Tensor, expert_idx: int) -> None:
 def fused_moe_kernel_gptq_awq(
         # Pointers to matrices
         a_ptr,
+        META,
         b_ptr,
         c_ptr,
         b_scale_ptr,
@@ -127,6 +129,7 @@ def fused_moe_kernel_gptq_awq(
 def fused_moe_kernel(
         # Pointers to matrices
         a_ptr,
+        META,
         b_ptr,
         c_ptr,
         a_scale_ptr,
