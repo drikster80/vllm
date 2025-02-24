@@ -1111,6 +1111,12 @@ direct_register_custom_op(
     fake_impl=outplace_fused_experts_fake,
 )
 
+# Add environment variable to control expert streams
+if "VLLM_ENABLE_MOE_EXPERT_STREAMS" not in envs.__dict__:
+    envs.VLLM_ENABLE_MOE_EXPERT_STREAMS = bool(
+        int(os.environ.get("VLLM_ENABLE_MOE_EXPERT_STREAMS", "1"))
+    )
+
 
 def fused_experts(hidden_states: torch.Tensor,
                   w1: torch.Tensor,
