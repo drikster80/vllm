@@ -133,6 +133,9 @@ class DeepseekMoE(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
             )
+            
+        # Mark this module as GPU-resident to prevent CPU offloading
+        self.gpu_resident = True
 
     def pack_params(self):
         w1 = []
@@ -144,14 +147,21 @@ class DeepseekMoE(nn.Module):
         w1s = torch._utils._unflatten_dense_tensors(self.w1, w1)
         for data, param in zip(w1s, w1):
             param.data = data
+            # Mark expert parameters as GPU-resident
+            param.gpu_resident = True
         self.w1 = self.w1.view(len(w1), *w1s[0].shape)
+        # Mark packed weights as GPU-resident
+        self.w1.gpu_resident = True
 
         self.w2 = torch._utils._flatten_dense_tensors(w2)
         w2s = torch._utils._unflatten_dense_tensors(self.w2, w2)
         for data, param in zip(w2s, w2):
             param.data = data
-
+            # Mark expert parameters as GPU-resident
+            param.gpu_resident = True
         self.w2 = self.w2.view(len(w2), *w2s[0].shape)
+        # Mark packed weights as GPU-resident
+        self.w2.gpu_resident = True
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
@@ -496,8 +506,13 @@ class DeepseekForCausalLM(nn.Module, SupportsPP):
                 if is_pp_missing_parameter(name, self):
                     continue
                 param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
+                
+                # Use gpu_weight_loader for expert parameters
+                if "mlp.experts" in name or "mlp.w1" in name or "mlp.w2" in name:
+                    weight_loader = gpu_weight_loader
+                else:
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params

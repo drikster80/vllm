@@ -643,6 +643,9 @@ def invoke_fused_moe_kernel(A: torch.Tensor,
                             block_shape: Optional[List[int]] = None,
                             expert_idx: Optional[int] = None,
                             stream: Optional[torch.cuda.Stream] = None) -> None:
+    # Ensure expert weights are on GPU
+    if B.device.type == "cpu" and torch.cuda.is_available():
+        B = B.to("cuda", non_blocking=True)
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 
