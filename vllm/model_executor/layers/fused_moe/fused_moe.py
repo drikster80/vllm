@@ -689,8 +689,18 @@ def invoke_fused_moe_kernel(A: torch.Tensor,
     max_tokens = expert_token_counts.max().item()
     max_tokens_per_expert = ceil_div(max_tokens, config["BLOCK_SIZE_M"]) * config["BLOCK_SIZE_M"]
 
+    # Only launch kernels for experts that have tokens assigned
+    active_experts = torch.unique(expert_ids).tolist()
+    num_active_experts = len(active_experts)
+    expert_to_idx = {e: i for i, e in enumerate(active_experts)}
+    
+    # Remap expert IDs to dense indices for kernel launch
+    expert_ids = torch.tensor([expert_to_idx[e.item()] for e in expert_ids], 
+                             device=expert_ids.device,
+                             dtype=expert_ids.dtype)
+
     grid = lambda META: (
-        B.shape[0],  # num_experts
+        num_active_experts,  # Only launch for active experts
         triton.cdiv(max_tokens_per_expert, META['BLOCK_SIZE_M']),
         triton.cdiv(B.shape[1], META['BLOCK_SIZE_N'])
     )

@@ -155,10 +155,14 @@ class DeepseekMoE(nn.Module):
             param.data = data
         self.w2 = self.w2.view(len(w2), *w2s[0].shape)
         
-        # Initialize expert cache manager as model attribute
-        self.expert_cache_manager = ExpertCacheManager()
+        # Initialize expert cache manager optimized for sparse access
+        self.expert_cache_manager = ExpertCacheManager(
+            num_experts=len(self.experts),
+            sparse_lookup=True  # Enable optimized sparse lookup
+        )
         
         # Register expert weights with cache manager
+        # Note: Cache manager now uses sparse data structures internally
         for expert_idx in range(len(self.experts)):
             self.expert_cache_manager.register(expert_idx, self.w1[expert_idx])
             self.expert_cache_manager.register(expert_idx, self.w2[expert_idx])
