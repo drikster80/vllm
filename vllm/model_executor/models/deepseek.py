@@ -155,13 +155,13 @@ class DeepseekMoE(nn.Module):
             param.data = data
         self.w2 = self.w2.view(len(w2), *w2s[0].shape)
         
-        # Initialize expert cache manager
-        self.expert_cache = ExpertCacheManager()
+        # Initialize expert cache manager as model attribute
+        self.expert_cache_manager = ExpertCacheManager()
         
         # Register expert weights with cache manager
         for expert_idx in range(len(self.experts)):
-            self.expert_cache.register(expert_idx, self.w1[expert_idx])
-            self.expert_cache.register(expert_idx, self.w2[expert_idx])
+            self.expert_cache_manager.register(expert_idx, self.w1[expert_idx])
+            self.expert_cache_manager.register(expert_idx, self.w2[expert_idx])
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape

@@ -139,10 +139,15 @@ def fused_moe_kernel_gptq_awq(
         b_ptrs = b_ptr + off_experts * stride_be + \
             offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
 
-    if not has_zp and use_int4_w4a16:
-        b_zp_num = 8
-    if not has_zp and use_int8_w8a16:
-        b_zp_num = 128
+    # Initialize default zero points
+    b_zp_num = 0
+    b_zp_shifter = 0
+    
+    if not has_zp:
+        if use_int4_w4a16:
+            b_zp_num = 8
+        elif use_int8_w8a16:
+            b_zp_num = 128
     elif has_zp and use_int4_w4a16:
         b_zp_shifter = (offs_bn[None, :] % 2) * 4
 
@@ -671,9 +676,15 @@ def invoke_fused_moe_kernel(A: torch.Tensor,
         EM = min(sorted_token_ids.shape[0],
                  A.shape[0] * top_k * config['BLOCK_SIZE_M'])
     # Compute a uniform padded token count per expert
+    # Compute per-expert token counts by checking which tokens are assigned to each expert
     expert_token_counts = torch.zeros(B.shape[0], dtype=torch.int32, device=A.device)
-    for expert_idx in range(B.shape[0]):
-        expert_token_counts[expert_idx] = (sorted_token_ids < num_tokens_post_padded).sum()
+    expert_ranges = torch.zeros(B.shape[0] + 1, dtype=torch.int32, device=A.device)
+    expert_ranges[1:] = num_tokens_post_padded
+    for i in range(expert_ids.numel()):
+        expert_idx = expert_ids[i].item()
+        start_idx = i * config["BLOCK_SIZE_M"] 
+        end_idx = min(start_idx + config["BLOCK_SIZE_M"], sorted_token_ids.numel())
+        expert_token_counts[expert_idx] = end_idx - start_idx
     
     max_tokens = expert_token_counts.max().item()
     max_tokens_per_expert = ceil_div(max_tokens, config["BLOCK_SIZE_M"]) * config["BLOCK_SIZE_M"]
@@ -1241,12 +1252,14 @@ def fused_experts_impl(hidden_states: torch.Tensor,
         sorted_token_ids, expert_ids, num_tokens_post_padded = (
             moe_align_block_size(curr_topk_ids, config['BLOCK_SIZE_M'], E))
 
-        # Check and load experts via cache manager
-        for expert in range(E):
-            if not w1.expert_cache.is_resident(expert):
-                w1.expert_cache.load_expert(expert, w1[expert])
-            if not w2.expert_cache.is_resident(expert):
-                w2.expert_cache.load_expert(expert, w2[expert])
+        # Get the unique experts needed for this chunk
+        chunk_experts = torch.unique(expert_ids).cpu().tolist()
+        
+        # Check and load only the needed experts via cache manager
+        for expert in chunk_experts:
+            if not model.expert_cache_manager.is_resident(expert):
+                model.expert_cache_manager.load_expert(expert, w1[expert])
+                model.expert_cache_manager.load_expert(expert, w2[expert])
 
         invoke_fused_moe_kernel(curr_hidden_states,
                                 w1,
