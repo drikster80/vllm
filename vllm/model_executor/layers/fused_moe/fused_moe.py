@@ -1241,12 +1241,12 @@ def fused_experts_impl(hidden_states: torch.Tensor,
         sorted_token_ids, expert_ids, num_tokens_post_padded = (
             moe_align_block_size(curr_topk_ids, config['BLOCK_SIZE_M'], E))
 
-        # Check and initiate async copies of expert weights
+        # Check and load experts via cache manager
         for expert in range(E):
-            if is_in_pinned_memory(w1, expert):
-                async_copy_expert(w1, expert)
-            if is_in_pinned_memory(w2, expert):
-                async_copy_expert(w2, expert)
+            if not w1.expert_cache.is_resident(expert):
+                w1.expert_cache.load_expert(expert, w1[expert])
+            if not w2.expert_cache.is_resident(expert):
+                w2.expert_cache.load_expert(expert, w2[expert])
 
         invoke_fused_moe_kernel(curr_hidden_states,
                                 w1,

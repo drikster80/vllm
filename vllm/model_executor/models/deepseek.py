@@ -135,11 +135,14 @@ class DeepseekMoE(nn.Module):
             )
 
     def pack_params(self):
+        from vllm.model_executor.layers.fused_moe.expert_cache import ExpertCacheManager
+        
         w1 = []
         w2 = []
         for expert in self.experts:
             w1.append(expert.gate_up_proj.weight)
             w2.append(expert.down_proj.weight)
+            
         self.w1 = torch._utils._flatten_dense_tensors(w1)
         w1s = torch._utils._unflatten_dense_tensors(self.w1, w1)
         for data, param in zip(w1s, w1):
@@ -150,8 +153,15 @@ class DeepseekMoE(nn.Module):
         w2s = torch._utils._unflatten_dense_tensors(self.w2, w2)
         for data, param in zip(w2s, w2):
             param.data = data
-
         self.w2 = self.w2.view(len(w2), *w2s[0].shape)
+        
+        # Initialize expert cache manager
+        self.expert_cache = ExpertCacheManager()
+        
+        # Register expert weights with cache manager
+        for expert_idx in range(len(self.experts)):
+            self.expert_cache.register(expert_idx, self.w1[expert_idx])
+            self.expert_cache.register(expert_idx, self.w2[expert_idx])
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
