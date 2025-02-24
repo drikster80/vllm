@@ -20,6 +20,21 @@ from .fused_moe import ceil_div, get_config_dtype_str
 
 logger = init_logger(__name__)
 
+def compute_expert_token_counts(sorted_token_ids: torch.Tensor,
+                              num_tokens: int,
+                              num_experts: int,
+                              block_size: int) -> torch.Tensor:
+    """Compute the number of tokens assigned to each expert."""
+    expert_counts = torch.zeros(num_experts, 
+                              dtype=torch.int32,
+                              device=sorted_token_ids.device)
+    # Count tokens per expert from sorted_token_ids layout
+    for expert_id in range(num_experts):
+        start_idx = expert_id * block_size
+        valid_tokens = sorted_token_ids[start_idx:start_idx + block_size]
+        expert_counts[expert_id] = (valid_tokens < num_tokens).sum()
+    return expert_counts
+
 # Helper functions for expert weight caching
 def is_in_pinned_memory(weights: torch.Tensor, expert_idx: int) -> bool:
     # TODO: Implement check for whether expert weights are in pinned memory
