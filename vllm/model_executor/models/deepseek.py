@@ -27,6 +27,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 import torch
 from torch import nn
 from transformers import PretrainedConfig
+from collections import OrderedDict
 
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import CacheConfig, VllmConfig
@@ -89,6 +90,47 @@ class DeepseekMLP(nn.Module):
         return x
 
 
+class ExpertCache:
+    """LRU cache for expert weights with eviction policy."""
+    
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self.cache = OrderedDict()
+    
+    def get(self, key: int) -> bool:
+        """Get an item from the cache and update its position."""
+        if key in self.cache:
+            # Move to the end to mark as most recently used
+            self.cache.move_to_end(key)
+            return True
+        return False
+    
+    def put(self, key: int) -> None:
+        """Add an item to the cache."""
+        self.cache[key] = True
+        self.cache.move_to_end(key)
+        
+        # Evict least recently used item if over capacity
+        if len(self.cache) > self.capacity:
+            return self.evict()
+        return None
+    
+    def evict(self) -> int:
+        """Evict the least recently used item from the cache."""
+        if not self.cache:
+            return None
+        # Get and remove the first item (least recently used)
+        key, _ = next(iter(self.cache.items()))
+        del self.cache[key]
+        return key
+    
+    def __contains__(self, key: int) -> bool:
+        return key in self.cache
+    
+    def __len__(self) -> int:
+        return len(self.cache)
+
+
 class DeepseekMoE(nn.Module):
 
     def __init__(
@@ -122,6 +164,8 @@ class DeepseekMoE(nn.Module):
                                      self.n_routed_experts,
                                      bias=False,
                                      quant_config=None)
+        # Mark gate as GPU-resident
+        self.gate.gpu_resident = True
 
         if config.n_shared_experts is not None:
             intermediate_size = (config.moe_intermediate_size *
@@ -133,6 +177,8 @@ class DeepseekMoE(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
             )
+            # Mark shared experts as GPU-resident
+            self.shared_experts.gpu_resident = True
             
         # Mark this module as GPU-resident to prevent CPU offloading
         self.gpu_resident = True
@@ -162,6 +208,61 @@ class DeepseekMoE(nn.Module):
         self.w2 = self.w2.view(len(w2), *w2s[0].shape)
         # Mark packed weights as GPU-resident
         self.w2.gpu_resident = True
+        
+        # Create pinned memory copies of expert weights
+        self.pinned_w1 = self.w1.detach().clone().cpu().pin_memory()
+        self.pinned_w2 = self.w2.detach().clone().cpu().pin_memory()
+        
+        # Calculate expert cache capacity based on available GPU memory
+        # Use a safety margin of 20% to avoid OOM errors
+        if torch.cuda.is_available():
+            device_props = torch.cuda.get_device_properties(self.w1.device)
+            free_memory, total_memory = torch.cuda.mem_get_info(self.w1.device)
+            # Calculate memory per expert (w1 + w2)
+            expert_mem_bytes = (self.w1[0].numel() * self.w1[0].element_size() + 
+                               self.w2[0].numel() * self.w2[0].element_size())
+            # Use 80% of free memory as safety margin
+            usable_memory = free_memory * 0.8
+            cache_capacity = int(usable_memory // expert_mem_bytes)
+            # Ensure at least 1 expert can be cached
+            self.expert_cache_capacity = max(1, min(cache_capacity, self.n_routed_experts))
+            logger.info(f"Expert cache capacity: {self.expert_cache_capacity} out of {self.n_routed_experts} experts")
+        else:
+            # Default to 2 experts if CUDA is not available (for CPU testing)
+            self.expert_cache_capacity = 2
+            
+        # Initialize expert cache with LRU policy
+        self.expert_cache = ExpertCache(self.expert_cache_capacity)
+        
+        # Pre-populate cache with initial experts
+        for idx in range(min(self.n_routed_experts, self.expert_cache_capacity)):
+            self.expert_cache.put(idx)
+
+    def update_expert_cache(self, required_experts: Set[int]):
+        """Update the expert cache to ensure required experts are loaded in GPU memory."""
+        for expert_id in required_experts:
+            if expert_id in self.expert_cache:
+                # Update LRU status for this expert
+                self.expert_cache.get(expert_id)
+            else:
+                # Need to load this expert - may trigger eviction
+                evicted_id = self.expert_cache.put(expert_id)
+                
+                # If we evicted an expert, we could optionally copy it back to pinned memory
+                # (skipping for now as we maintain the pinned copy separately)
+                
+                # Asynchronously copy expert from pinned memory to GPU
+                # For w1
+                gpu_copy = self.pinned_w1[expert_id].to(self.w1.device, non_blocking=True)
+                self.w1[expert_id].copy_(gpu_copy)
+                
+                # For w2
+                gpu_copy = self.pinned_w2[expert_id].to(self.w2.device, non_blocking=True)
+                self.w2[expert_id].copy_(gpu_copy)
+                
+                # Log the expert swap
+                if evicted_id is not None:
+                    logger.debug(f"Expert cache: evicted expert {evicted_id}, loaded expert {expert_id}")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
@@ -170,6 +271,24 @@ class DeepseekMoE(nn.Module):
             shared_output = self.shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        
+        # Get top-k experts for each token
+        topk_weights, topk_ids = torch.topk(
+            torch.softmax(router_logits, dim=-1),
+            k=self.top_k,
+            dim=-1,
+            sorted=False
+        )
+        
+        # Determine which experts are needed for this batch
+        required_expert_ids = set(topk_ids.flatten().cpu().tolist())
+        
+        # Update expert cache to ensure required experts are loaded
+        self.update_expert_cache(required_expert_ids)
+        
+        # Ensure all expert data is synchronized before computation
+        torch.cuda.synchronize()
+        
         final_hidden_states = fused_moe(hidden_states,
                                         self.w1,
                                         self.w2,
@@ -253,6 +372,11 @@ class DeepseekAttention(nn.Module):
                               cache_config=cache_config,
                               quant_config=quant_config,
                               prefix=f"{prefix}.attn")
+        
+        # Mark attention components as GPU-resident
+        self.gpu_resident = True
+        self.qkv_proj.gpu_resident = True
+        self.o_proj.gpu_resident = True
 
     def forward(
         self,
@@ -362,6 +486,8 @@ class DeepseekModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
         )
+        # Mark embeddings as GPU-resident
+        self.embed_tokens.gpu_resident = True
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekDecoderLayer(

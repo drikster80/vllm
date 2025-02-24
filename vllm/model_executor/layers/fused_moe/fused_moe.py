@@ -1193,7 +1193,7 @@ def invoke_per_expert_moe_kernel(
     if not expert_mask.any():
         return  # No tokens for this expert
     
-    # Get the expert's weights
+    # Get the expert's weights - ensure they're on the correct device
     expert_w1 = w1[expert_idx:expert_idx+1]  # Keep dimension for stride calculation
     expert_w2 = w2[expert_idx:expert_idx+1]
     
