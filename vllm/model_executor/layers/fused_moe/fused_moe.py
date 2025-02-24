@@ -684,7 +684,7 @@ def invoke_fused_moe_kernel(A: torch.Tensor,
         expert_idx = expert_ids[i].item()
         start_idx = i * config["BLOCK_SIZE_M"] 
         end_idx = min(start_idx + config["BLOCK_SIZE_M"], sorted_token_ids.numel())
-        expert_token_counts[expert_idx] = end_idx - start_idx
+        expert_token_counts[expert_idx] += end_idx - start_idx
     
     max_tokens = expert_token_counts.max().item()
     max_tokens_per_expert = ceil_div(max_tokens, config["BLOCK_SIZE_M"]) * config["BLOCK_SIZE_M"]
@@ -705,9 +705,11 @@ def invoke_fused_moe_kernel(A: torch.Tensor,
         triton.cdiv(B.shape[1], META['BLOCK_SIZE_N'])
     )
 
+    # Subset expert counts to match remapped expert IDs
+    active_expert_counts = expert_token_counts[active_experts]
     meta_params = {
         "MAX_PADDED_TOKENS_PER_EXPERT": max_tokens_per_expert,
-        "expert_token_counts": expert_token_counts,
+        "expert_token_counts": active_expert_counts,
         **config
     }
 
@@ -1267,9 +1269,9 @@ def fused_experts_impl(hidden_states: torch.Tensor,
         
         # Check and load only the needed experts via cache manager
         for expert in chunk_experts:
-            if not w1.expert_cache_manager.is_resident(expert):
-                w1.expert_cache_manager.load_expert(expert, w1[expert])
-                w1.expert_cache_manager.load_expert(expert, w2[expert])
+            if not self.expert_cache_manager.is_resident(expert):
+                self.expert_cache_manager.load_expert(expert, w1[expert])
+                self.expert_cache_manager.load_expert(expert, w2[expert])
 
         invoke_fused_moe_kernel(curr_hidden_states,
                                 w1,

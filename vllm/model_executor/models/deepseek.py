@@ -134,9 +134,53 @@ class DeepseekMoE(nn.Module):
                 reduce_results=False,
             )
 
-    def pack_params(self):
+    def __init__(self, config: PretrainedConfig, quant_config: Optional[QuantizationConfig] = None, prefix: str = ""):
+        super().__init__()
         from vllm.model_executor.layers.fused_moe.expert_cache import ExpertCacheManager
         
+        self.config = config
+        self.rank = get_tensor_model_parallel_rank()
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.n_routed_experts = config.n_routed_experts
+        self.top_k = config.num_experts_per_tok
+        if self.tp_size > self.n_routed_experts:
+            raise ValueError(
+                f"Tensor parallel size {self.tp_size} is greater than "
+                f"the number of experts {self.n_routed_experts}.")
+
+        self.experts = nn.ModuleList([
+            DeepseekMLP(hidden_size=config.hidden_size,
+                        intermediate_size=config.moe_intermediate_size,
+                        hidden_act=config.hidden_act,
+                        quant_config=quant_config,
+                        reduce_results=False)
+            for idx in range(self.n_routed_experts)
+        ])
+        
+        # Initialize expert cache manager optimized for sparse access
+        self.expert_cache_manager = ExpertCacheManager(
+            num_experts=len(self.experts),
+            sparse_lookup=True  # Enable optimized sparse lookup
+        )
+
+        self.gate = ReplicatedLinear(config.hidden_size,
+                                     self.n_routed_experts,
+                                     bias=False,
+                                     quant_config=None)
+
+        if config.n_shared_experts is not None:
+            intermediate_size = (config.moe_intermediate_size *
+                                 config.n_shared_experts)
+            self.shared_experts = DeepseekMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                reduce_results=False,
+            )
+        self.pack_params()
+
+    def pack_params(self):
         w1 = []
         w2 = []
         for expert in self.experts:
@@ -155,14 +199,7 @@ class DeepseekMoE(nn.Module):
             param.data = data
         self.w2 = self.w2.view(len(w2), *w2s[0].shape)
         
-        # Initialize expert cache manager optimized for sparse access
-        self.expert_cache_manager = ExpertCacheManager(
-            num_experts=len(self.experts),
-            sparse_lookup=True  # Enable optimized sparse lookup
-        )
-        
         # Register expert weights with cache manager
-        # Note: Cache manager now uses sparse data structures internally
         for expert_idx in range(len(self.experts)):
             self.expert_cache_manager.register(expert_idx, self.w1[expert_idx])
             self.expert_cache_manager.register(expert_idx, self.w2[expert_idx])
