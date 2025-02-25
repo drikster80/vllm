@@ -1371,20 +1371,18 @@ def fused_experts_impl(hidden_states: torch.Tensor,
             moe_align_block_size(curr_topk_ids, config['BLOCK_SIZE_M'], E))
         
         if expert_streams is not None:
+            compute_events = []
             # Process each expert in its own stream
             for expert_idx in range(E):
                 stream = expert_streams.get(expert_idx)
                 
-                # If this expert has a transfer event, wait on it before computing
+                # Wait on transfer event for this expert if exists
                 expert_transfer_events = getattr(w1, 'expert_transfer_events', None)
                 if expert_transfer_events and expert_idx in expert_transfer_events:
-                    if stream:
-                        stream.wait_event(expert_transfer_events[expert_idx])
-                    else:
-                        torch.cuda.current_stream().wait_event(expert_transfer_events[expert_idx])
-                    # Remove the event once waited upon
+                    stream.wait_event(expert_transfer_events[expert_idx])
                     del expert_transfer_events[expert_idx]
                 
+                # Launch per-expert kernel
                 invoke_per_expert_moe_kernel(
                     expert_idx,
                     curr_hidden_states,
@@ -1413,10 +1411,16 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                     stream,
                     expert_transfer_events
                 )
+                
+                # Immediately record a compute completion event on this expert stream
+                event = torch.cuda.Event()
+                event.record(stream)
+                compute_events.append(event)
             
-            # Synchronize all streams before continuing
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+            # In place of a global sync, wait for every expert's compute event
+            main_stream = torch.cuda.current_stream()
+            for event in compute_events:
+                main_stream.wait_event(event)
         else:
             # Original implementation without streams
             invoke_fused_moe_kernel(curr_hidden_states,

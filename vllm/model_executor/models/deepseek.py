@@ -305,8 +305,7 @@ class DeepseekMoE(nn.Module):
         # Update expert cache to ensure required experts are loaded
         self.update_expert_cache(required_expert_ids)
         
-        # Ensure all expert data is synchronized before computation
-        torch.cuda.synchronize()
+        # Remove global sync here to allow experts to load/compute concurrently
         
         final_hidden_states = fused_moe(hidden_states,
                                         self.w1,
