@@ -349,9 +349,9 @@ FROM vllm-base AS vllm-openai-base
 # install additional dependencies for openai api server
 RUN --mount=type=cache,target=/root/.cache/pip \
     if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
-        pip install --system accelerate hf_transfer 'modelscope!=1.15.0' 'bitsandbytes>=0.45.0' 'timm==0.9.10' 'boto3' 'runai-model-streamer' 'runai-model-streamer[s3]'; \
+        pip install accelerate hf_transfer 'modelscope!=1.15.0' 'bitsandbytes>=0.45.0' 'timm==0.9.10' 'boto3' 'runai-model-streamer' 'runai-model-streamer[s3]'; \
     else \
-        pip install --system accelerate hf_transfer 'modelscope!=1.15.0' 'bitsandbytes>=0.45.0' 'timm==0.9.10' 'boto3' 'runai-model-streamer' 'runai-model-streamer[s3]'; \
+        pip install accelerate hf_transfer 'modelscope!=1.15.0' 'bitsandbytes>=0.45.0' 'timm==0.9.10' 'boto3' 'runai-model-streamer' 'runai-model-streamer[s3]'; \
     fi
 ENV VLLM_USAGE_SOURCE production-docker-image
 
