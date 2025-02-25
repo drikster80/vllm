@@ -217,6 +217,13 @@ class DeepseekMoE(nn.Module):
         self.pinned_w1 = self.w1.detach().clone().cpu().pin_memory()
         self.pinned_w2 = self.w2.detach().clone().cpu().pin_memory()
         
+        # Create a dedicated transfer stream and event dictionary
+        if torch.cuda.is_available():
+            self.transfer_stream = torch.cuda.Stream()
+            self.expert_transfer_events = {}
+            # Attach the event dictionary to w1 for access in fused_moe.py
+            self.w1.expert_transfer_events = self.expert_transfer_events
+        
         # Calculate expert cache capacity based on available GPU memory
         # Use a safety margin of 20% to avoid OOM errors
         if torch.cuda.is_available():
@@ -244,29 +251,37 @@ class DeepseekMoE(nn.Module):
 
     def update_expert_cache(self, required_experts: Set[int]):
         """Update the expert cache to ensure required experts are loaded in GPU memory."""
+        missing_experts = []  # list of expert IDs missing from GPU
+        
         for expert_id in required_experts:
             if expert_id in self.expert_cache:
                 # Update LRU status for this expert
                 self.expert_cache.get(expert_id)
             else:
                 # Need to load this expert - may trigger eviction
+                missing_experts.append(expert_id)
                 evicted_id = self.expert_cache.put(expert_id)
-                
-                # If we evicted an expert, we could optionally copy it back to pinned memory
-                # (skipping for now as we maintain the pinned copy separately)
-                
-                # Asynchronously copy expert from pinned memory to GPU
-                # For w1
-                gpu_copy = self.pinned_w1[expert_id].to(self.w1.device, non_blocking=True)
-                self.w1[expert_id].copy_(gpu_copy)
-                
-                # For w2
-                gpu_copy = self.pinned_w2[expert_id].to(self.w2.device, non_blocking=True)
-                self.w2[expert_id].copy_(gpu_copy)
                 
                 # Log the expert swap
                 if evicted_id is not None:
-                    logger.debug(f"Expert cache: evicted expert {evicted_id}, loaded expert {expert_id}")
+                    logger.debug(f"Expert cache: evicted expert {evicted_id}, loading expert {expert_id}")
+        
+        # For each missing expert, issue asynchronous copies on the dedicated transfer stream
+        if torch.cuda.is_available() and missing_experts:
+            with torch.cuda.stream(self.transfer_stream):
+                for expert_id in missing_experts:
+                    # For w1
+                    gpu_copy_w1 = self.pinned_w1[expert_id].to(self.w1.device, non_blocking=True)
+                    self.w1[expert_id].copy_(gpu_copy_w1)
+                    
+                    # For w2
+                    gpu_copy_w2 = self.pinned_w2[expert_id].to(self.w2.device, non_blocking=True)
+                    self.w2[expert_id].copy_(gpu_copy_w2)
+                    
+                    # Record an event once the copies (for this expert) are enqueued
+                    event = torch.cuda.Event()
+                    event.record()  # This records on the current transfer_stream
+                    self.expert_transfer_events[expert_id] = event
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape

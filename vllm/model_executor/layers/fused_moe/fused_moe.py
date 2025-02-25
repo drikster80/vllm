@@ -1185,7 +1185,8 @@ def invoke_per_expert_moe_kernel(
     a1_scale: Optional[torch.Tensor],
     a2_scale: Optional[torch.Tensor],
     block_shape: Optional[List[int]],
-    stream: Optional[torch.cuda.Stream] = None
+    stream: Optional[torch.cuda.Stream] = None,
+    expert_transfer_events: Optional[Dict[int, torch.cuda.Event]] = None
 ) -> None:
     """Process tokens for a single expert"""
     # Find blocks assigned to this expert
@@ -1373,6 +1374,17 @@ def fused_experts_impl(hidden_states: torch.Tensor,
             # Process each expert in its own stream
             for expert_idx in range(E):
                 stream = expert_streams.get(expert_idx)
+                
+                # If this expert has a transfer event, wait on it before computing
+                expert_transfer_events = getattr(w1, 'expert_transfer_events', None)
+                if expert_transfer_events and expert_idx in expert_transfer_events:
+                    if stream:
+                        stream.wait_event(expert_transfer_events[expert_idx])
+                    else:
+                        torch.cuda.current_stream().wait_event(expert_transfer_events[expert_idx])
+                    # Remove the event once waited upon
+                    del expert_transfer_events[expert_idx]
+                
                 invoke_per_expert_moe_kernel(
                     expert_idx,
                     curr_hidden_states,
@@ -1398,7 +1410,8 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                     a1_scale,
                     a2_scale,
                     block_shape,
-                    stream
+                    stream,
+                    expert_transfer_events
                 )
             
             # Synchronize all streams before continuing
