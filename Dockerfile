@@ -181,7 +181,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
         apt-get update && apt-get install zlib1g-dev && \
         python3 -m pip install packaging pybind11 && \
-        git clone -b release/3.1.x https://github.com/openai/triton && \
+        git clone -b release/3.2.x https://github.com/openai/triton && \
         cd triton/python && \
         git submodule update --init --recursive && \
         pip --verbose wheel --use-pep517 --no-deps -w /workspace/dist --no-build-isolation --no-cache-dir . ; \
