@@ -3,6 +3,7 @@
 import functools
 import json
 import os
+from collections import defaultdict
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -639,7 +640,12 @@ def invoke_fused_moe_kernel(A: torch.Tensor,
                             use_fp8_w8a8: bool,
                             use_int8_w8a16: bool,
                             use_int4_w4a16: bool,
-                            block_shape: Optional[List[int]] = None) -> None:
+                            block_shape: Optional[List[int]] = None,
+                            expert_idx: Optional[int] = None,
+                            stream: Optional[torch.cuda.Stream] = None) -> None:
+    # Ensure expert weights are on GPU
+    if B.device.type == "cpu" and torch.cuda.is_available():
+        B = B.to("cuda", non_blocking=True)
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 
@@ -669,93 +675,111 @@ def invoke_fused_moe_kernel(A: torch.Tensor,
         # and we can skip some invalid blocks.
         EM = min(sorted_token_ids.shape[0],
                  A.shape[0] * top_k * config['BLOCK_SIZE_M'])
-    grid = lambda META: (triton.cdiv(EM, META['BLOCK_SIZE_M']) * triton.cdiv(
-        B.shape[1], META['BLOCK_SIZE_N']), )
-
-    if (use_int8_w8a16 or use_int4_w4a16) and \
-            block_shape is not None and block_shape[1] > 0:
-        assert B_scale is not None and B_scale.ndim == 3
-        assert B_zp is None or B_zp.ndim == 3
-
-        fused_moe_kernel_gptq_awq[grid](
-            A,
-            B,
-            C,
-            B_scale,
-            B_zp,
-            topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            B.shape[1],
-            A.shape[1],
-            EM,
-            topk_ids.numel(),
-            A.stride(0),
-            A.stride(1),
-            B.stride(0),
-            B.stride(2),
-            B.stride(1),
-            C.stride(1),
-            C.stride(2),
-            B_scale.stride(0),
-            B_scale.stride(2),
-            B_scale.stride(1),
-            B_zp.stride(0) if B_zp is not None else 0,
-            B_zp.stride(2) if B_zp is not None else 0,
-            B_zp.stride(1) if B_zp is not None else 0,
-            block_k_diviable=A.shape[1] % config["BLOCK_SIZE_K"] == 0,
-            group_size=block_shape[1],
-            MUL_ROUTED_WEIGHT=mul_routed_weight,
-            top_k=top_k,
-            compute_type=compute_type,
-            has_zp=B_zp is not None,
-            use_int4_w4a16=use_int4_w4a16,
-            use_int8_w8a16=use_int8_w8a16,
-            **config,
-        )
-
+    
+    # If expert_idx is provided, filter tokens for this expert
+    if expert_idx is not None:
+        # Find blocks assigned to this expert
+        expert_mask = expert_ids == expert_idx
+        if not expert_mask.any():
+            return  # No tokens for this expert
+        
+        # Get indices of blocks for this expert
+        expert_block_indices = torch.nonzero(expert_mask).squeeze(-1)
+        
+        # Calculate grid only for this expert's blocks
+        expert_EM = len(expert_block_indices) * config['BLOCK_SIZE_M']
+        grid = lambda META: (triton.cdiv(expert_EM, META['BLOCK_SIZE_M']) * 
+                            triton.cdiv(B.shape[1], META['BLOCK_SIZE_N']), )
     else:
-        fused_moe_kernel[grid](
-            A,
-            B,
-            C,
-            A_scale,
-            B_scale,
-            topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            B.shape[1],
-            A.shape[1],
-            EM,
-            topk_ids.numel(),
-            A.stride(0),
-            A.stride(1),
-            B.stride(0),
-            B.stride(2),
-            B.stride(1),
-            C.stride(1),
-            C.stride(2),
-            A_scale.stride(0)
-            if A_scale is not None and A_scale.ndim == 2 else 0,
-            A_scale.stride(1)
-            if A_scale is not None and A_scale.ndim == 2 else 0,
-            B_scale.stride(0)
-            if B_scale is not None and B_scale.ndim >= 2 else 0,
-            B_scale.stride(2)
-            if B_scale is not None and B_scale.ndim == 3 else 0,
-            B_scale.stride(1)
-            if B_scale is not None and B_scale.ndim >= 2 else 0,
-            0 if block_shape is None else block_shape[0],
-            0 if block_shape is None else block_shape[1],
-            MUL_ROUTED_WEIGHT=mul_routed_weight,
-            top_k=top_k,
-            compute_type=compute_type,
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
-            **config,
-        )
+        grid = lambda META: (triton.cdiv(EM, META['BLOCK_SIZE_M']) * 
+                            triton.cdiv(B.shape[1], META['BLOCK_SIZE_N']), )
+
+    # Use the provided stream if available
+    with torch.cuda.stream(stream) if stream is not None else nullcontext():
+        if (use_int8_w8a16 or use_int4_w4a16) and \
+                block_shape is not None and block_shape[1] > 0:
+            assert B_scale is not None and B_scale.ndim == 3
+            assert B_zp is None or B_zp.ndim == 3
+
+            fused_moe_kernel_gptq_awq[grid](
+                A,
+                B,
+                C,
+                B_scale,
+                B_zp,
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                B.shape[1],
+                A.shape[1],
+                EM,
+                topk_ids.numel(),
+                A.stride(0),
+                A.stride(1),
+                B.stride(0),
+                B.stride(2),
+                B.stride(1),
+                C.stride(1),
+                C.stride(2),
+                B_scale.stride(0),
+                B_scale.stride(2),
+                B_scale.stride(1),
+                B_zp.stride(0) if B_zp is not None else 0,
+                B_zp.stride(2) if B_zp is not None else 0,
+                B_zp.stride(1) if B_zp is not None else 0,
+                block_k_diviable=A.shape[1] % config["BLOCK_SIZE_K"] == 0,
+                group_size=block_shape[1],
+                MUL_ROUTED_WEIGHT=mul_routed_weight,
+                top_k=top_k,
+                compute_type=compute_type,
+                has_zp=B_zp is not None,
+                use_int4_w4a16=use_int4_w4a16,
+                use_int8_w8a16=use_int8_w8a16,
+                **config,
+            )
+
+        else:
+            fused_moe_kernel[grid](
+                A,
+                B,
+                C,
+                A_scale,
+                B_scale,
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                B.shape[1],
+                A.shape[1],
+                EM,
+                topk_ids.numel(),
+                A.stride(0),
+                A.stride(1),
+                B.stride(0),
+                B.stride(2),
+                B.stride(1),
+                C.stride(1),
+                C.stride(2),
+                A_scale.stride(0)
+                if A_scale is not None and A_scale.ndim == 2 else 0,
+                A_scale.stride(1)
+                if A_scale is not None and A_scale.ndim == 2 else 0,
+                B_scale.stride(0)
+                if B_scale is not None and B_scale.ndim >= 2 else 0,
+                B_scale.stride(2)
+                if B_scale is not None and B_scale.ndim == 3 else 0,
+                B_scale.stride(1)
+                if B_scale is not None and B_scale.ndim >= 2 else 0,
+                0 if block_shape is None else block_shape[0],
+                0 if block_shape is None else block_shape[1],
+                MUL_ROUTED_WEIGHT=mul_routed_weight,
+                top_k=top_k,
+                compute_type=compute_type,
+                use_fp8_w8a8=use_fp8_w8a8,
+                use_int8_w8a16=use_int8_w8a16,
+                **config,
+            )
 
 
 # Adapted from: https://github.com/sgl-project/sglang/pull/2628
@@ -1007,10 +1031,12 @@ def inplace_fused_experts(hidden_states: torch.Tensor,
                           w2_zp: Optional[torch.Tensor] = None,
                           a1_scale: Optional[torch.Tensor] = None,
                           a2_scale: Optional[torch.Tensor] = None,
-                          block_shape: Optional[List[int]] = None) -> None:
+                          block_shape: Optional[List[int]] = None,
+                          expert_streams: Optional[Dict[int, torch.cuda.Stream]] = None) -> None:
     fused_experts_impl(hidden_states, w1, w2, topk_weights, topk_ids, True,
                        use_fp8_w8a8, use_int8_w8a16, use_int4_w4a16, w1_scale,
-                       w2_scale, w1_zp, w2_zp, a1_scale, a2_scale, block_shape)
+                       w2_scale, w1_zp, w2_zp, a1_scale, a2_scale, block_shape,
+                       expert_streams)
 
 
 def inplace_fused_experts_fake(
@@ -1028,7 +1054,8 @@ def inplace_fused_experts_fake(
         w2_zp: Optional[torch.Tensor] = None,
         a1_scale: Optional[torch.Tensor] = None,
         a2_scale: Optional[torch.Tensor] = None,
-        block_shape: Optional[List[int]] = None) -> None:
+        block_shape: Optional[List[int]] = None,
+        expert_streams: Optional[Dict[int, torch.cuda.Stream]] = None) -> None:
     pass
 
 
@@ -1055,11 +1082,12 @@ def outplace_fused_experts(
         w2_zp: Optional[torch.Tensor] = None,
         a1_scale: Optional[torch.Tensor] = None,
         a2_scale: Optional[torch.Tensor] = None,
-        block_shape: Optional[List[int]] = None) -> torch.Tensor:
+        block_shape: Optional[List[int]] = None,
+        expert_streams: Optional[Dict[int, torch.cuda.Stream]] = None) -> torch.Tensor:
     return fused_experts_impl(hidden_states, w1, w2, topk_weights, topk_ids,
                               False, use_fp8_w8a8, use_int8_w8a16,
                               use_int4_w4a16, w1_scale, w2_scale, w1_zp, w2_zp,
-                              a1_scale, a2_scale, block_shape)
+                              a1_scale, a2_scale, block_shape, expert_streams)
 
 
 def outplace_fused_experts_fake(
@@ -1077,7 +1105,8 @@ def outplace_fused_experts_fake(
         w2_zp: Optional[torch.Tensor] = None,
         a1_scale: Optional[torch.Tensor] = None,
         a2_scale: Optional[torch.Tensor] = None,
-        block_shape: Optional[List[int]] = None) -> torch.Tensor:
+        block_shape: Optional[List[int]] = None,
+        expert_streams: Optional[Dict[int, torch.cuda.Stream]] = None) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
 
@@ -1087,6 +1116,12 @@ direct_register_custom_op(
     mutates_args=[],
     fake_impl=outplace_fused_experts_fake,
 )
+
+# Add environment variable to control expert streams
+if "VLLM_ENABLE_MOE_EXPERT_STREAMS" not in envs.__dict__:
+    envs.VLLM_ENABLE_MOE_EXPERT_STREAMS = bool(
+        int(os.environ.get("VLLM_ENABLE_MOE_EXPERT_STREAMS", "1"))
+    )
 
 
 def fused_experts(hidden_states: torch.Tensor,
@@ -1104,7 +1139,8 @@ def fused_experts(hidden_states: torch.Tensor,
                   w2_zp: Optional[torch.Tensor] = None,
                   a1_scale: Optional[torch.Tensor] = None,
                   a2_scale: Optional[torch.Tensor] = None,
-                  block_shape: Optional[List[int]] = None):
+                  block_shape: Optional[List[int]] = None,
+                  expert_streams: Optional[Dict[int, torch.cuda.Stream]] = None):
     if inplace:
         torch.ops.vllm.inplace_fused_experts(hidden_states, w1, w2,
                                              topk_weights, topk_ids,
@@ -1119,6 +1155,111 @@ def fused_experts(hidden_states: torch.Tensor,
             use_int8_w8a16, use_int4_w4a16, w1_scale, w2_scale, w1_zp, w2_zp,
             a1_scale, a2_scale, block_shape)
 
+
+class nullcontext:
+    def __enter__(self):
+        return None
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+def invoke_per_expert_moe_kernel(
+    expert_idx: int,
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    intermediate_cache1: torch.Tensor,
+    intermediate_cache2: torch.Tensor,
+    intermediate_cache3: torch.Tensor,
+    config: Dict[str, Any],
+    compute_type: tl.dtype,
+    use_fp8_w8a8: bool,
+    use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
+    w1_scale: Optional[torch.Tensor],
+    w2_scale: Optional[torch.Tensor],
+    w1_zp: Optional[torch.Tensor],
+    w2_zp: Optional[torch.Tensor],
+    a1_scale: Optional[torch.Tensor],
+    a2_scale: Optional[torch.Tensor],
+    block_shape: Optional[List[int]],
+    stream: Optional[torch.cuda.Stream] = None,
+    expert_transfer_events: Optional[Dict[int, torch.cuda.Event]] = None
+) -> None:
+    """Process tokens for a single expert"""
+    # Find blocks assigned to this expert
+    expert_mask = expert_ids == expert_idx
+    if not expert_mask.any():
+        return  # No tokens for this expert
+    
+    # Get the expert's weights - ensure they're on the correct device
+    expert_w1 = w1[expert_idx:expert_idx+1]  # Keep dimension for stride calculation
+    expert_w2 = w2[expert_idx:expert_idx+1]
+    
+    # Get scales for this expert if needed
+    expert_w1_scale = w1_scale[expert_idx:expert_idx+1] if w1_scale is not None else None
+    expert_w2_scale = w2_scale[expert_idx:expert_idx+1] if w2_scale is not None else None
+    expert_w1_zp = w1_zp[expert_idx:expert_idx+1] if w1_zp is not None else None
+    expert_w2_zp = w2_zp[expert_idx:expert_idx+1] if w2_zp is not None else None
+    
+    # First MoE kernel for this expert
+    invoke_fused_moe_kernel(
+        hidden_states,
+        expert_w1,
+        intermediate_cache1,
+        a1_scale,
+        expert_w1_scale,
+        expert_w1_zp,
+        topk_weights,
+        topk_ids,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        False,
+        topk_ids.shape[1],
+        config,
+        compute_type=compute_type,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+        block_shape=block_shape,
+        expert_idx=expert_idx,
+        stream=stream
+    )
+    
+    # Apply activation function
+    with torch.cuda.stream(stream) if stream is not None else nullcontext():
+        torch.ops._C.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, intermediate_cache1.size(-1)))
+    
+    # Second MoE kernel for this expert
+    invoke_fused_moe_kernel(
+        intermediate_cache2,
+        expert_w2,
+        intermediate_cache3,
+        a2_scale,
+        expert_w2_scale,
+        expert_w2_zp,
+        topk_weights,
+        topk_ids,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        True,
+        1,
+        config,
+        compute_type=compute_type,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+        block_shape=block_shape,
+        expert_idx=expert_idx,
+        stream=stream
+    )
 
 def fused_experts_impl(hidden_states: torch.Tensor,
                        w1: torch.Tensor,
@@ -1135,7 +1276,8 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                        w2_zp: Optional[torch.Tensor] = None,
                        a1_scale: Optional[torch.Tensor] = None,
                        a2_scale: Optional[torch.Tensor] = None,
-                       block_shape: Optional[List[int]] = None):
+                       block_shape: Optional[List[int]] = None,
+                       expert_streams: Optional[Dict[int, torch.cuda.Stream]] = None):
     # Check constraints.
     if use_int4_w4a16:
         assert hidden_states.shape[1] // 2 == w1.shape[
@@ -1197,6 +1339,14 @@ def fused_experts_impl(hidden_states: torch.Tensor,
     else:
         out_hidden_states = torch.empty_like(hidden_states)
 
+    # Create streams for each expert if not provided
+    if expert_streams is None and torch.cuda.is_available():
+        use_streams = envs.VLLM_ENABLE_MOE_EXPERT_STREAMS
+        if use_streams:
+            expert_streams = {
+                i: torch.cuda.Stream() for i in range(E)
+            }
+    
     for chunk in range((num_tokens // CHUNK_SIZE) + 1):
         begin_chunk_idx, end_chunk_idx = (chunk * CHUNK_SIZE,
                                           min((chunk + 1) * CHUNK_SIZE,
@@ -1222,49 +1372,102 @@ def fused_experts_impl(hidden_states: torch.Tensor,
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = (
             moe_align_block_size(curr_topk_ids, config['BLOCK_SIZE_M'], E))
+        
+        if expert_streams is not None:
+            compute_events = []
+            # Process each expert in its own stream
+            for expert_idx in range(E):
+                stream = expert_streams.get(expert_idx)
+                
+                # Wait on transfer event for this expert if exists
+                expert_transfer_events = getattr(w1, 'expert_transfer_events', None)
+                if expert_transfer_events and expert_idx in expert_transfer_events:
+                    stream.wait_event(expert_transfer_events[expert_idx])
+                    del expert_transfer_events[expert_idx]
+                
+                # Launch per-expert kernel
+                invoke_per_expert_moe_kernel(
+                    expert_idx,
+                    curr_hidden_states,
+                    w1,
+                    w2,
+                    curr_topk_weights,
+                    curr_topk_ids,
+                    sorted_token_ids,
+                    expert_ids,
+                    num_tokens_post_padded,
+                    intermediate_cache1,
+                    intermediate_cache2,
+                    intermediate_cache3,
+                    config,
+                    compute_type,
+                    use_fp8_w8a8,
+                    use_int8_w8a16,
+                    use_int4_w4a16,
+                    w1_scale,
+                    w2_scale,
+                    w1_zp,
+                    w2_zp,
+                    a1_scale,
+                    a2_scale,
+                    block_shape,
+                    stream,
+                    expert_transfer_events
+                )
+                
+                # Immediately record a compute completion event on this expert stream
+                event = torch.cuda.Event()
+                event.record(stream)
+                compute_events.append(event)
+            
+            # In place of a global sync, wait for every expert's compute event
+            main_stream = torch.cuda.current_stream()
+            for event in compute_events:
+                main_stream.wait_event(event)
+        else:
+            # Original implementation without streams
+            invoke_fused_moe_kernel(curr_hidden_states,
+                                    w1,
+                                    intermediate_cache1,
+                                    a1_scale,
+                                    w1_scale,
+                                    w1_zp,
+                                    curr_topk_weights,
+                                    curr_topk_ids,
+                                    sorted_token_ids,
+                                    expert_ids,
+                                    num_tokens_post_padded,
+                                    False,
+                                    topk_ids.shape[1],
+                                    config,
+                                    compute_type=compute_type,
+                                    use_fp8_w8a8=use_fp8_w8a8,
+                                    use_int8_w8a16=use_int8_w8a16,
+                                    use_int4_w4a16=use_int4_w4a16,
+                                    block_shape=block_shape)
 
-        invoke_fused_moe_kernel(curr_hidden_states,
-                                w1,
-                                intermediate_cache1,
-                                a1_scale,
-                                w1_scale,
-                                w1_zp,
-                                curr_topk_weights,
-                                curr_topk_ids,
-                                sorted_token_ids,
-                                expert_ids,
-                                num_tokens_post_padded,
-                                False,
-                                topk_ids.shape[1],
-                                config,
-                                compute_type=compute_type,
-                                use_fp8_w8a8=use_fp8_w8a8,
-                                use_int8_w8a16=use_int8_w8a16,
-                                use_int4_w4a16=use_int4_w4a16,
-                                block_shape=block_shape)
+            torch.ops._C.silu_and_mul(intermediate_cache2,
+                                    intermediate_cache1.view(-1, N))
 
-        torch.ops._C.silu_and_mul(intermediate_cache2,
-                                  intermediate_cache1.view(-1, N))
-
-        invoke_fused_moe_kernel(intermediate_cache2,
-                                w2,
-                                intermediate_cache3,
-                                a2_scale,
-                                w2_scale,
-                                w2_zp,
-                                curr_topk_weights,
-                                curr_topk_ids,
-                                sorted_token_ids,
-                                expert_ids,
-                                num_tokens_post_padded,
-                                True,
-                                1,
-                                config,
-                                compute_type=compute_type,
-                                use_fp8_w8a8=use_fp8_w8a8,
-                                use_int8_w8a16=use_int8_w8a16,
-                                use_int4_w4a16=use_int4_w4a16,
-                                block_shape=block_shape)
+            invoke_fused_moe_kernel(intermediate_cache2,
+                                    w2,
+                                    intermediate_cache3,
+                                    a2_scale,
+                                    w2_scale,
+                                    w2_zp,
+                                    curr_topk_weights,
+                                    curr_topk_ids,
+                                    sorted_token_ids,
+                                    expert_ids,
+                                    num_tokens_post_padded,
+                                    True,
+                                    1,
+                                    config,
+                                    compute_type=compute_type,
+                                    use_fp8_w8a8=use_fp8_w8a8,
+                                    use_int8_w8a16=use_int8_w8a16,
+                                    use_int4_w4a16=use_int4_w4a16,
+                                    block_shape=block_shape)
 
         ops.moe_sum(intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states[begin_chunk_idx:end_chunk_idx])
@@ -1293,6 +1496,7 @@ def fused_moe(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    expert_streams: Optional[Dict[int, torch.cuda.Stream]] = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -1330,6 +1534,8 @@ def fused_moe(
         a2.
     - block_shape: (Optional[List[int]]): Optional block size for block-wise
         quantization.
+    - expert_streams: (Optional[Dict[int, torch.cuda.Stream]]): Optional dictionary
+        mapping expert indices to CUDA streams for parallel execution.
 
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
@@ -1364,4 +1570,5 @@ def fused_moe(
                          w2_zp=w2_zp,
                          a1_scale=a1_scale,
                          a2_scale=a2_scale,
-                         block_shape=block_shape)
+                         block_shape=block_shape,
+                         expert_streams=expert_streams)

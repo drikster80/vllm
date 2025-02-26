@@ -539,6 +539,34 @@ def default_weight_loader(param: torch.Tensor,
         raise
 
 
+def gpu_weight_loader(param: torch.Tensor,
+                      loaded_weight: torch.Tensor) -> None:
+    """Weight loader that ensures weights stay on GPU.
+    
+    This loader is used for expert modules to prevent them from being
+    offloaded to CPU during initialization.
+    """
+    try:
+        if param.numel() == 1 and loaded_weight.numel() == 1:
+            param.data.fill_(loaded_weight.item())
+        else:
+            assert param.size() == loaded_weight.size(), (
+                f"Attempted to load weight ({loaded_weight.size()}) "
+                f"into parameter ({param.size()})")
+            
+            # Ensure the parameter stays on GPU
+            if param.device.type == "cpu" and torch.cuda.is_available():
+                param.data = param.data.to("cuda")
+            
+            # Copy the loaded weight to the parameter
+            param.data.copy_(loaded_weight)
+            
+            # Set an attribute to mark this parameter as GPU-resident
+            param.gpu_resident = True
+    except Exception:
+        raise
+
+
 def row_parallel_weight_loader(param: torch.Tensor,
                                loaded_weight: torch.Tensor) -> None:
     """Load weights that are row-parallelized."""

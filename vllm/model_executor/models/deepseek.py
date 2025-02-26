@@ -27,6 +27,9 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 import torch
 from torch import nn
 from transformers import PretrainedConfig
+from collections import OrderedDict
+
+from vllm.logger import init_logger
 
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import CacheConfig, VllmConfig
@@ -46,7 +49,7 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead, VocabParallelEmbedding)
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader, gpu_weight_loader
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 
@@ -54,6 +57,8 @@ from .interfaces import SupportsPP
 from .utils import (extract_layer_index, is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
+
+logger = init_logger(__name__)
 
 
 class DeepseekMLP(nn.Module):
@@ -89,6 +94,47 @@ class DeepseekMLP(nn.Module):
         return x
 
 
+class ExpertCache:
+    """LRU cache for expert weights with eviction policy."""
+    
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self.cache = OrderedDict()
+    
+    def get(self, key: int) -> bool:
+        """Get an item from the cache and update its position."""
+        if key in self.cache:
+            # Move to the end to mark as most recently used
+            self.cache.move_to_end(key)
+            return True
+        return False
+    
+    def put(self, key: int) -> None:
+        """Add an item to the cache."""
+        self.cache[key] = True
+        self.cache.move_to_end(key)
+        
+        # Evict least recently used item if over capacity
+        if len(self.cache) > self.capacity:
+            return self.evict()
+        return None
+    
+    def evict(self) -> int:
+        """Evict the least recently used item from the cache."""
+        if not self.cache:
+            return None
+        # Get and remove the first item (least recently used)
+        key, _ = next(iter(self.cache.items()))
+        del self.cache[key]
+        return key
+    
+    def __contains__(self, key: int) -> bool:
+        return key in self.cache
+    
+    def __len__(self) -> int:
+        return len(self.cache)
+
+
 class DeepseekMoE(nn.Module):
 
     def __init__(
@@ -122,6 +168,8 @@ class DeepseekMoE(nn.Module):
                                      self.n_routed_experts,
                                      bias=False,
                                      quant_config=None)
+        # Mark gate as GPU-resident
+        self.gate.gpu_resident = True
 
         if config.n_shared_experts is not None:
             intermediate_size = (config.moe_intermediate_size *
@@ -133,6 +181,11 @@ class DeepseekMoE(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
             )
+            # Mark shared experts as GPU-resident
+            self.shared_experts.gpu_resident = True
+            
+        # Mark this module as GPU-resident to prevent CPU offloading
+        self.gpu_resident = True
 
     def pack_params(self):
         w1 = []
@@ -144,14 +197,91 @@ class DeepseekMoE(nn.Module):
         w1s = torch._utils._unflatten_dense_tensors(self.w1, w1)
         for data, param in zip(w1s, w1):
             param.data = data
+            # Mark expert parameters as GPU-resident
+            param.gpu_resident = True
         self.w1 = self.w1.view(len(w1), *w1s[0].shape)
+        # Mark packed weights as GPU-resident
+        self.w1.gpu_resident = True
 
         self.w2 = torch._utils._flatten_dense_tensors(w2)
         w2s = torch._utils._unflatten_dense_tensors(self.w2, w2)
         for data, param in zip(w2s, w2):
             param.data = data
-
+            # Mark expert parameters as GPU-resident
+            param.gpu_resident = True
         self.w2 = self.w2.view(len(w2), *w2s[0].shape)
+        # Mark packed weights as GPU-resident
+        self.w2.gpu_resident = True
+        
+        # Create pinned memory copies of expert weights
+        self.pinned_w1 = self.w1.detach().clone().cpu().pin_memory()
+        self.pinned_w2 = self.w2.detach().clone().cpu().pin_memory()
+        
+        # Create a dedicated transfer stream and event dictionary
+        if torch.cuda.is_available():
+            self.transfer_stream = torch.cuda.Stream()
+            self.expert_transfer_events = {}
+            # Attach the event dictionary to w1 for access in fused_moe.py
+            self.w1.expert_transfer_events = self.expert_transfer_events
+        
+        # Calculate expert cache capacity based on available GPU memory
+        # Use a safety margin of 20% to avoid OOM errors
+        if torch.cuda.is_available():
+            device_props = torch.cuda.get_device_properties(self.w1.device)
+            free_memory, total_memory = torch.cuda.mem_get_info(self.w1.device)
+            # Calculate memory per expert (w1 + w2)
+            expert_mem_bytes = (self.w1[0].numel() * self.w1[0].element_size() + 
+                               self.w2[0].numel() * self.w2[0].element_size())
+            # Use 80% of free memory as safety margin
+            usable_memory = free_memory * 0.8
+            cache_capacity = int(usable_memory // expert_mem_bytes)
+            # Ensure at least 1 expert can be cached
+            self.expert_cache_capacity = max(1, min(cache_capacity, self.n_routed_experts))
+            logger.info(f"Expert cache capacity: {self.expert_cache_capacity} out of {self.n_routed_experts} experts")
+        else:
+            # Default to 2 experts if CUDA is not available (for CPU testing)
+            self.expert_cache_capacity = 2
+            
+        # Initialize expert cache with LRU policy
+        self.expert_cache = ExpertCache(self.expert_cache_capacity)
+        
+        # Pre-populate cache with initial experts
+        for idx in range(min(self.n_routed_experts, self.expert_cache_capacity)):
+            self.expert_cache.put(idx)
+
+    def update_expert_cache(self, required_experts: Set[int]):
+        """Update the expert cache to ensure required experts are loaded in GPU memory."""
+        missing_experts = []  # list of expert IDs missing from GPU
+        
+        for expert_id in required_experts:
+            if expert_id in self.expert_cache:
+                # Update LRU status for this expert
+                self.expert_cache.get(expert_id)
+            else:
+                # Need to load this expert - may trigger eviction
+                missing_experts.append(expert_id)
+                evicted_id = self.expert_cache.put(expert_id)
+                
+                # Log the expert swap
+                if evicted_id is not None:
+                    logger.debug(f"Expert cache: evicted expert {evicted_id}, loading expert {expert_id}")
+        
+        # For each missing expert, issue asynchronous copies on the dedicated transfer stream
+        if torch.cuda.is_available() and missing_experts:
+            with torch.cuda.stream(self.transfer_stream):
+                for expert_id in missing_experts:
+                    # For w1
+                    gpu_copy_w1 = self.pinned_w1[expert_id].to(self.w1.device, non_blocking=True)
+                    self.w1[expert_id].copy_(gpu_copy_w1)
+                    
+                    # For w2
+                    gpu_copy_w2 = self.pinned_w2[expert_id].to(self.w2.device, non_blocking=True)
+                    self.w2[expert_id].copy_(gpu_copy_w2)
+                    
+                    # Record an event once the copies (for this expert) are enqueued
+                    event = torch.cuda.Event()
+                    event.record()  # This records on the current transfer_stream
+                    self.expert_transfer_events[expert_id] = event
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
@@ -160,6 +290,23 @@ class DeepseekMoE(nn.Module):
             shared_output = self.shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        
+        # Get top-k experts for each token
+        topk_weights, topk_ids = torch.topk(
+            torch.softmax(router_logits, dim=-1),
+            k=self.top_k,
+            dim=-1,
+            sorted=False
+        )
+        
+        # Determine which experts are needed for this batch
+        required_expert_ids = set(topk_ids.flatten().cpu().tolist())
+        
+        # Update expert cache to ensure required experts are loaded
+        self.update_expert_cache(required_expert_ids)
+        
+        # Remove global sync here to allow experts to load/compute concurrently
+        
         final_hidden_states = fused_moe(hidden_states,
                                         self.w1,
                                         self.w2,
@@ -243,6 +390,11 @@ class DeepseekAttention(nn.Module):
                               cache_config=cache_config,
                               quant_config=quant_config,
                               prefix=f"{prefix}.attn")
+        
+        # Mark attention components as GPU-resident
+        self.gpu_resident = True
+        self.qkv_proj.gpu_resident = True
+        self.o_proj.gpu_resident = True
 
     def forward(
         self,
@@ -352,6 +504,8 @@ class DeepseekModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
         )
+        # Mark embeddings as GPU-resident
+        self.embed_tokens.gpu_resident = True
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekDecoderLayer(
@@ -496,8 +650,13 @@ class DeepseekForCausalLM(nn.Module, SupportsPP):
                 if is_pp_missing_parameter(name, self):
                     continue
                 param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
+                
+                # Use gpu_weight_loader for expert parameters
+                if "mlp.experts" in name or "mlp.w1" in name or "mlp.w2" in name:
+                    weight_loader = gpu_weight_loader
+                else:
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params

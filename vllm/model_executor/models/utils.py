@@ -485,6 +485,10 @@ def set_cpu_offload_max_bytes(max_bytes: int) -> None:
 
 
 def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
+    # Skip offloading if module is marked as GPU-resident
+    if getattr(module, "gpu_resident", False):
+        return module
+    
     device = next(module.parameters()).device
 
     if device == torch.device("cpu"):
@@ -500,6 +504,10 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
     # use pin_memory if possible, which helps cudagraph capture speed
     offloaded_parameters = False
     for p in module.parameters():
+        # Skip parameters marked as GPU-resident
+        if getattr(p, "gpu_resident", False):
+            continue
+            
         if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
             # we use per-parameter offloading
             # one module might have some parameters offloaded and some not
