@@ -198,6 +198,7 @@ class EngineArgs:
     override_pooler_config: Optional[PoolerConfig] = None
     compilation_config: Optional[CompilationConfig] = None
     worker_cls: str = "auto"
+    expert_log_dir: Optional[str] = None
 
     kv_transfer_config: Optional[KVTransferConfig] = None
 
@@ -233,6 +234,11 @@ class EngineArgs:
         # Setup plugins
         from vllm.plugins import load_general_plugins
         load_general_plugins()
+        
+        # Initialize expert log directory global if provided
+        if self.expert_log_dir is not None:
+            import vllm.envs as envs
+            envs.EXPERT_LOG_DIR = self.expert_log_dir
 
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
@@ -987,6 +993,11 @@ class EngineArgs:
             type=str,
             default="auto",
             help='The worker class to use for distributed execution.')
+        parser.add_argument(
+            '--expert-log-dir',
+            type=str,
+            default=None,
+            help='Directory path for logging expert selection bitmaps per forward pass.')
         parser.add_argument(
             "--generation-config",
             type=nullable_str,

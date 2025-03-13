@@ -1348,6 +1348,22 @@ def fused_moe(
     else:
         topk_weights, topk_ids = custom_routing_function(
             hidden_states, gating_output, topk, renormalize)
+            
+    # Log per-token expert selection data for later training of a lightweight expert predictor.
+    if getattr(envs, "EXPERT_LOG_DIR", None):
+        n_tokens = topk_ids.shape[0]
+        n_experts = gating_output.shape[1]
+        log_path = os.path.join(envs.EXPERT_LOG_DIR, "expert_selection.jsonl")
+        with open(log_path, "a") as f:
+            # For each token, build a boolean mask from its topk_ids and convert to a bitmap string.
+            for token_idx in range(n_tokens):
+                row = topk_ids[token_idx]  # shape: (topk,)
+                mask = torch.zeros(n_experts, dtype=torch.bool, device=topk_ids.device)
+                mask.scatter_(0, row.view(-1), True)
+                bitmap = "".join("1" if flag else "0" for flag in mask.cpu().tolist())
+                # Log the token index along with its expert selection bitmap.
+                log_entry = {"token_index": token_idx, "expert_bitmap": bitmap}
+                f.write(json.dumps(log_entry) + "\n")
 
     return fused_experts(hidden_states,
                          w1,
