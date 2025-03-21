@@ -4,9 +4,9 @@ requires = [
     "cmake>=3.26",
     "ninja",
     "packaging",
-    "setuptools>=61",
+    "setuptools>=74.1.1,<75.9",
     "setuptools-scm>=8.0",
-    "torch == 2.6.0",
+    "torch >= 2.6.0",
     "wheel",
     "jinja2",
 ]
